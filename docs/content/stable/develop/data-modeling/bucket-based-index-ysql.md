@@ -15,27 +15,23 @@ tags:
 type: docs
 ---
 
-Traditional leading range (ASC/DESC) indexes with monotonic inserts concentrate all writes on the "most recent" tablet, creating [hot shards](../hot-shards-ysql/) and uneven resource usage. By prepending a bucket column (often a hash code modulo of a key column) to the ASC/DESC key, writes can be evenly distributed across multiple tablets (buckets), achieving write scalability and balanced resource usage.
+Bucket-based indexes give you the write distribution of hash sharding and the read ordering of range sharding — without sacrificing either. The tension they resolve is fundamental to how distributed databases handle monotonically increasing keys like timestamps or sequential IDs. Range sharding keeps range reads simple — adjacent keys land on the same tablet — but concentrates all writes on whichever tablet holds the newest keys. Hash sharding solves that write hotspot by distributing rows evenly across tablets, but destroys ordering in the process: even a small range read has to scan every tablet in full and perform a global sort to reconstruct sequence.
 
-The goal is to have a globally ordered result (for example, the latest 1000 rows by timestamp) while avoiding write hot spots on a monotonically increasing column. Bucket-based indexes solve the hot spot issue by distributing data across multiple tablets (buckets). The system can return a globally ordered result for range queries and LIMIT clauses without a sort operation, even though the data is physically sharded by the bucket. This makes queries like top-N and keyset pagination very efficient.
+Let's take an example of a monitoring table that stores readings by timestamp, and whose most common query reads the most recent 1000 rows. If this is range-sharded, the most recent data always goes to the same tablet, and the most common query is always contending with active writes because it is reading from the same place — a pattern known as a hot tablet. Using hash sharding would solve the write hotspot, but to satisfy that query for the most recent 1000 rows the database would have to:
 
-{{<tags/feature/ea idea="2275">}}In addition, YugabyteDB (v2025.2.1.0 and later) includes scan optimizations for bucket-based indexes that can produce a globally ordered result without query changes, even when additional ranges are introduced into the index structure.
+1. Query each tablet in its entirety (since the hash does not store data in order)
+2. Collect all results from all tablets into one place.
+3. Perform a final global sort to ensure the total result set is correctly ordered and apply the LIMIT clause.
 
-Normally, to get a globally ordered result for the most recent 1000 rows by timestamp (for example) from data that is sharded across multiple tablets, the database would have to:
+To make this into a bucket-based index, you put a deterministic hash bucket column at the head of the index key and let the rest of the key stay range-ordered. In YugabyteDB, this is done with a modulo on a hash column `yb_hash_code(col) % N` where N is the bucket count. For our example, let's further specify that each bucket is assigned its own tablet using `SPLIT AT`. Writes now spread across N tablets because each row's bucket is determined by the hash; within each tablet, the bucket column is constant, so rows stay ordered by the second index column.
 
-1. Query each tablet.
-1. Collect all of the results into one place.
-1. Perform a final global sort to ensure the total result set is correctly ordered, even with a LIMIT clause.
+So for the most recent 1000 rows, the database now only needs to:
 
-This is resource-intensive and slow.
+1. Query the last 1000 rows on each tablet
+2. Merge the pre-sorted results across the streams and apply the LIMIT
 
-Using a bucket-based index with bucket-based scan optimizations enabled, the database can "push down" the LIMIT request to each of the individual tablets (buckets).
+What makes this work without query changes is the combination of the schema and the query planner. When you ask for ordered results with a LIMIT as above, the planner detects the bucket-based schema and pushes down the sort-and-limit to all N tablets in parallel. It then treats each stream as locally sorted, and merges them into a single globally-ordered set to apply the LIMIT and return results. The query is the same as what would be written for a single-node B-tree in a non-distributed database.
 
-For example, for a timestamp column that is the second column in the index (and ordered ASC), for each bucket, we can quickly find its top 1000 locally ordered rows. The database only has to scan 1000 rows per bucket instead of scanning potentially millions of rows that match the larger range condition.
-
-The index then performs an efficient merge of the small, pre-sorted result sets from each bucket to produce the final globally ordered 1000 rows without a final global sort.
-
-In short, it achieves the necessary write scalability and global ordering simultaneously, making OLTP top-N queries exceptionally fast.
 
 ## When to use it
 
